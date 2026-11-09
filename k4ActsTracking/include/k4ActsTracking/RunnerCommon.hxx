@@ -32,6 +32,7 @@
 #include <edm4hep/MutableTrack.h>
 #include <edm4hep/TrackState.h>
 #include <edm4hep/TrackerHit.h>
+#include <edm4hep/TrackerHitPlane.h>
 #include <edm4hep/TrackerHitPlaneCollection.h>
 
 // podio
@@ -426,6 +427,36 @@ namespace ACTSTracking {
     return (static_cast<std::uint64_t>(id.collectionID) << 32) | static_cast<std::uint32_t>(id.index);
   }
 
+  /// Covariance of a planar hit in the local frame of @p surface. du/dv are given
+  /// along the hit's own u/v axes, which need not match the surface's local x/y.
+  /// Backported from key4hep/k4ActsTracking PR#124 (v00-06).
+  inline Acts::SquareMatrix2 hitLocalCovariance(const Acts::GeometryContext& geoCtx, const Acts::Surface& surface,
+                                                const Acts::Vector3& globalPos, const edm4hep::TrackerHitPlane& hit) {
+    auto unit = [](const auto& a) {  // (theta, phi) -> unit vector
+      return Acts::Vector3(std::sin(a[0]) * std::cos(a[1]), std::sin(a[0]) * std::sin(a[1]), std::cos(a[0]));
+    };
+    const Acts::RotationMatrix3 frame = surface.referenceFrame(geoCtx, globalPos, Acts::Vector3::UnitZ());
+    const Acts::Vector3         ex    = frame.col(0);  // local x
+    const Acts::Vector3         ey    = frame.col(1);  // local y
+    const Acts::Vector3         u     = unit(hit.getU());
+    const Acts::Vector3         v     = unit(hit.getV());
+
+    // (u, v) -> (local x, local y)
+    // clang-format off
+    const Acts::SquareMatrix2 rot{{ex.dot(u), ex.dot(v)},
+                                  {ey.dot(u), ey.dot(v)}};
+    // clang-format on
+    // u/v must be an orthonormal basis of the surface plane, e.g. not left at the edm4hep default (0, 0)
+    if (std::abs(std::abs(rot.determinant()) - 1.0) > 1e-3) {
+      throw std::runtime_error("hitLocalCovariance: hit u/v axes do not span the surface plane (|det| = " +
+                               std::to_string(std::abs(rot.determinant())) + "), check the digitizer U/V");
+    }
+    Acts::SquareMatrix2 uvCov = Acts::SquareMatrix2::Zero();
+    uvCov(0, 0)               = std::pow(hit.getDu() * Acts::UnitConstants::mm, 2);
+    uvCov(1, 1)               = std::pow(hit.getDv() * Acts::UnitConstants::mm, 2);
+    return rot * uvCov * rot.transpose();
+  }
+
   /**
    * @brief Build the ACTS measurements and source links for a set of tracker hits.
    *
@@ -501,9 +532,7 @@ namespace ACTSTracking {
 
       Acts::Vector2 loc = lpResult.value();
 
-      Acts::SquareMatrix2 localCov = Acts::SquareMatrix2::Zero();
-      localCov(0, 0)               = std::pow(hitPair.second.getDu() * Acts::UnitConstants::mm, 2);
-      localCov(1, 1)               = std::pow(hitPair.second.getDv() * Acts::UnitConstants::mm, 2);
+      const Acts::SquareMatrix2 localCov = hitLocalCovariance(geoCtx, *surface, globalPos, hitPair.second);
 
       ACTSTracking::SourceLink  sourceLink(surface->geometryId(), measurements.size());
       Acts::SourceLink          srcWrap{sourceLink};
